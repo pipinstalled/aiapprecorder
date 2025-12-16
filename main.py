@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from pydub import AudioSegment
 from scipy.io import wavfile
 from scipy.signal import resample
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
@@ -71,7 +72,9 @@ class TranscriptionResponse(BaseModel):
 
 
 class Base64TranscriptionRequest(BaseModel):
-    audio_base64: str
+    audio: str  # base64 encoded audio
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -117,18 +120,88 @@ async def load_model():
             raise e
 
 
+def convert_audio_to_wav(input_path: str, output_path: str) -> str:
+    """
+    Convert any audio format to WAV using pydub
+    Returns the path to the converted WAV file
+    """
+    try:
+        # Detect format from file extension
+        file_ext = Path(input_path).suffix.lower()
+        
+        # Load audio file using pydub (supports many formats)
+        if file_ext == '.wav':
+            # Already WAV, just copy or return original
+            audio = AudioSegment.from_wav(input_path)
+        elif file_ext == '.mp3':
+            audio = AudioSegment.from_mp3(input_path)
+        elif file_ext == '.m4a':
+            audio = AudioSegment.from_file(input_path, format='m4a')
+        elif file_ext == '.flac':
+            audio = AudioSegment.from_file(input_path, format='flac')
+        elif file_ext == '.ogg':
+            audio = AudioSegment.from_ogg(input_path)
+        elif file_ext == '.aac':
+            audio = AudioSegment.from_file(input_path, format='aac')
+        else:
+            # Try to auto-detect format
+            audio = AudioSegment.from_file(input_path)
+        
+        # Export as WAV (16kHz, mono, 16-bit PCM)
+        audio = audio.set_frame_rate(TARGET_SAMPLE_RATE)
+        audio = audio.set_channels(1)  # Convert to mono
+        audio.export(output_path, format='wav')
+        
+        return output_path
+    except Exception as e:
+        print(f"Error converting audio to WAV: {e}")
+        raise ValueError(f"Failed to convert audio file: {str(e)}") from e
+
+
 def preprocess_audio(
     audio_file_path: str, target_sr: int = TARGET_SAMPLE_RATE
 ) -> tuple[np.ndarray, float]:
     """
     Preprocess audio file for wav2vec2 model
+    - Convert any format to WAV if needed
     - Convert to 16kHz sample rate
     - Normalize audio
     - Return audio array and duration
     """
     try:
-        # Load audio file using scipy
+        # Check if file is already WAV by reading first bytes
+        is_wav = False
+        try:
+            with open(audio_file_path, 'rb') as f:
+                header = f.read(4)
+                if header == b'RIFF' or header == b'RIFX':
+                    is_wav = True
+        except:
+            pass
+        
+        # Convert to WAV if needed
+        if not is_wav:
+            print(f"Converting {Path(audio_file_path).suffix} to WAV...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav:
+                wav_path = temp_wav.name
+            try:
+                convert_audio_to_wav(audio_file_path, wav_path)
+                audio_file_path = wav_path
+            except Exception as e:
+                # Clean up temp file if conversion failed
+                if os.path.exists(wav_path):
+                    os.unlink(wav_path)
+                raise e
+        
+        # Load audio file using scipy (now guaranteed to be WAV)
         sr, audio = wavfile.read(audio_file_path)
+        
+        # Clean up converted WAV file if it was temporary
+        if not is_wav and os.path.exists(audio_file_path):
+            try:
+                os.unlink(audio_file_path)
+            except:
+                pass
 
         # Convert to float and normalize
         if audio.dtype == np.int16:
@@ -137,6 +210,10 @@ def preprocess_audio(
             audio = audio.astype(np.float32) / 2147483648.0
         elif audio.dtype == np.uint8:
             audio = (audio.astype(np.float32) - 128.0) / 128.0
+
+        # Handle stereo audio (convert to mono by averaging channels)
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
 
         # Resample if necessary
         if sr != target_sr:
@@ -310,14 +387,50 @@ async def transcribe_base64_audio(
     try:
         # Decode base64 audio
         try:
-            audio_data = base64.b64decode(request.audio_base64)
+            audio_data = base64.b64decode(request.audio)
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Invalid base64 audio data: {str(e)}"
             ) from e
 
-        # Save to temporary file (assume WAV format for base64)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+        # Detect audio format from filename, content_type, or file header
+        file_ext = ".m4a"  # Default to m4a (common for React Native recordings)
+        
+        # Try filename first
+        if request.filename:
+            file_ext = Path(request.filename).suffix.lower() or ".m4a"
+        
+        # Try content_type second
+        elif request.content_type:
+            content_type_map = {
+                'audio/wav': '.wav',
+                'audio/mpeg': '.mp3',
+                'audio/mp4': '.m4a',
+                'audio/flac': '.flac',
+                'audio/ogg': '.ogg',
+                'audio/aac': '.aac',
+            }
+            file_ext = content_type_map.get(request.content_type, '.m4a')
+        
+        # Fallback: detect from file header
+        else:
+            if len(audio_data) >= 4:
+                header = audio_data[:4]
+                if header == b'RIFF' or header == b'RIFX':
+                    file_ext = ".wav"
+                elif header[:3] == b'ID3' or (len(audio_data) >= 2 and audio_data[0:2] == b'\xff\xfb'):
+                    file_ext = ".mp3"
+                elif header[:4] == b'fLaC':
+                    file_ext = ".flac"
+                elif header[:4] == b'OggS':
+                    file_ext = ".ogg"
+        
+        # Ensure extension is in supported formats
+        if file_ext not in SUPPORTED_FORMATS:
+            file_ext = ".m4a"  # Default fallback
+        
+        # Save to temporary file with detected extension
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
             temp_file.write(audio_data)
             temp_path = temp_file.name
 
