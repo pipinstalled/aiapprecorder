@@ -19,7 +19,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pydub import AudioSegment
 from scipy.io import wavfile
 from scipy.signal import resample
@@ -72,9 +72,21 @@ class TranscriptionResponse(BaseModel):
 
 
 class Base64TranscriptionRequest(BaseModel):
-    audio: str  # base64 encoded audio
+    audio: Optional[str] = None  # base64 encoded audio (new field name)
+    audio_base64: Optional[str] = None  # base64 encoded audio (old field name for backward compatibility)
     filename: Optional[str] = None
     content_type: Optional[str] = None
+    
+    @model_validator(mode='after')
+    def validate_audio_field(self):
+        """Ensure at least one audio field is provided"""
+        if not self.audio and not self.audio_base64:
+            raise ValueError("Either 'audio' or 'audio_base64' field must be provided")
+        return self
+    
+    def get_audio_data(self) -> str:
+        """Get audio data from either field name"""
+        return self.audio or self.audio_base64 or ""
 
 
 class HealthResponse(BaseModel):
@@ -385,9 +397,16 @@ async def transcribe_base64_audio(
     start_time = asyncio.get_event_loop().time()
 
     try:
+        # Get audio data from request (supports both 'audio' and 'audio_base64' field names)
+        audio_base64_str = request.get_audio_data()
+        if not audio_base64_str:
+            raise HTTPException(
+                status_code=400, detail="Missing 'audio' or 'audio_base64' field in request"
+            )
+        
         # Decode base64 audio
         try:
-            audio_data = base64.b64decode(request.audio)
+            audio_data = base64.b64decode(audio_base64_str)
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Invalid base64 audio data: {str(e)}"
