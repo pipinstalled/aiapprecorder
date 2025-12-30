@@ -76,6 +76,7 @@ class Base64TranscriptionRequest(BaseModel):
     audio_base64: Optional[str] = None  # base64 encoded audio (old field name for backward compatibility)
     filename: Optional[str] = None
     content_type: Optional[str] = None
+    file_extension: Optional[str] = None  # File extension (e.g., "m4a", "mp3") - helps with format detection
     
     @model_validator(mode='after')
     def validate_audio_field(self):
@@ -136,38 +137,75 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
     """
     Convert any audio format to WAV using pydub
     Returns the path to the converted WAV file
+    
+    Supports: MP3, M4A, FLAC, OGG, AAC, WMA, WAV, MP4, 3GP, etc.
     """
     try:
         # Detect format from file extension
         file_ext = Path(input_path).suffix.lower()
         
-        # Load audio file using pydub (supports many formats)
-        if file_ext == '.wav':
-            # Already WAV, just copy or return original
-            audio = AudioSegment.from_wav(input_path)
-        elif file_ext == '.mp3':
-            audio = AudioSegment.from_mp3(input_path)
-        elif file_ext == '.m4a':
-            audio = AudioSegment.from_file(input_path, format='m4a')
-        elif file_ext == '.flac':
-            audio = AudioSegment.from_file(input_path, format='flac')
-        elif file_ext == '.ogg':
-            audio = AudioSegment.from_ogg(input_path)
-        elif file_ext == '.aac':
-            audio = AudioSegment.from_file(input_path, format='aac')
+        print(f"Converting audio file: {input_path} (format: {file_ext})")
+        
+        # Map extensions to pydub format names
+        format_map = {
+            '.wav': 'wav',
+            '.mp3': 'mp3',
+            '.m4a': 'm4a',
+            '.mp4': 'm4a',  # MP4 audio is usually M4A
+            '.flac': 'flac',
+            '.ogg': 'ogg',
+            '.aac': 'aac',
+            '.wma': 'wma',
+            '.3gp': '3gp',
+        }
+        
+        # Get format, default to auto-detect if unknown
+        audio_format = format_map.get(file_ext, None)
+        
+        # Load audio file using pydub
+        if audio_format:
+            if audio_format == 'wav':
+                audio = AudioSegment.from_wav(input_path)
+            elif audio_format == 'mp3':
+                audio = AudioSegment.from_mp3(input_path)
+            elif audio_format == 'ogg':
+                audio = AudioSegment.from_ogg(input_path)
+            else:
+                # Use from_file for formats like m4a, flac, aac, etc.
+                audio = AudioSegment.from_file(input_path, format=audio_format)
         else:
-            # Try to auto-detect format
+            # Auto-detect format (pydub will try to detect)
+            print(f"Auto-detecting format for {file_ext}...")
             audio = AudioSegment.from_file(input_path)
         
-        # Export as WAV (16kHz, mono, 16-bit PCM)
+        print(f"Audio loaded: {len(audio)}ms, {audio.frame_rate}Hz, {audio.channels} channels")
+        
+        # Export as WAV with proper settings for wav2vec2
+        # Set to 16kHz mono (wav2vec2 requirement)
         audio = audio.set_frame_rate(TARGET_SAMPLE_RATE)
         audio = audio.set_channels(1)  # Convert to mono
-        audio.export(output_path, format='wav')
+        
+        # Export as WAV (PCM 16-bit)
+        audio.export(
+            output_path,
+            format='wav',
+            parameters=['-acodec', 'pcm_s16le']  # Ensure 16-bit PCM
+        )
+        
+        print(f"Successfully converted to WAV: {output_path}")
+        
+        # Verify the output file exists and has correct header
+        if os.path.exists(output_path):
+            with open(output_path, 'rb') as f:
+                header = f.read(4)
+                if header not in [b'RIFF', b'RIFX']:
+                    raise ValueError(f"Conversion failed: output file doesn't have WAV header. Got: {header}")
         
         return output_path
     except Exception as e:
         print(f"Error converting audio to WAV: {e}")
-        raise ValueError(f"Failed to convert audio file: {str(e)}") from e
+        print(f"Input file: {input_path}, Output file: {output_path}")
+        raise ValueError(f"Failed to convert audio file to WAV: {str(e)}") from e
 
 
 def preprocess_audio(
@@ -180,40 +218,47 @@ def preprocess_audio(
     - Normalize audio
     - Return audio array and duration
     """
+    original_file_path = audio_file_path
+    converted_file_path = None
+    is_wav = False
+    
     try:
         # Check if file is already WAV by reading first bytes
-        is_wav = False
         try:
             with open(audio_file_path, 'rb') as f:
                 header = f.read(4)
                 if header == b'RIFF' or header == b'RIFX':
                     is_wav = True
-        except:
-            pass
+                    print(f"File is already WAV format: {audio_file_path}")
+        except Exception as e:
+            print(f"Warning: Could not read file header: {e}")
         
         # Convert to WAV if needed
         if not is_wav:
-            print(f"Converting {Path(audio_file_path).suffix} to WAV...")
+            file_ext = Path(audio_file_path).suffix.lower()
+            print(f"Converting {file_ext} file to WAV format...")
+            
+            # Create temporary WAV file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav:
-                wav_path = temp_wav.name
+                converted_file_path = temp_wav.name
+            
             try:
-                convert_audio_to_wav(audio_file_path, wav_path)
-                audio_file_path = wav_path
+                # Convert to WAV
+                convert_audio_to_wav(audio_file_path, converted_file_path)
+                audio_file_path = converted_file_path
+                print(f"Conversion successful, using: {audio_file_path}")
             except Exception as e:
                 # Clean up temp file if conversion failed
-                if os.path.exists(wav_path):
-                    os.unlink(wav_path)
-                raise e
+                if converted_file_path and os.path.exists(converted_file_path):
+                    os.unlink(converted_file_path)
+                raise ValueError(f"Audio conversion failed: {str(e)}") from e
         
         # Load audio file using scipy (now guaranteed to be WAV)
-        sr, audio = wavfile.read(audio_file_path)
-        
-        # Clean up converted WAV file if it was temporary
-        if not is_wav and os.path.exists(audio_file_path):
-            try:
-                os.unlink(audio_file_path)
-            except:
-                pass
+        try:
+            sr, audio = wavfile.read(audio_file_path)
+            print(f"Loaded WAV file: {len(audio)} samples at {sr}Hz")
+        except Exception as e:
+            raise ValueError(f"Failed to read WAV file: {str(e)}") from e
 
         # Convert to float and normalize
         if audio.dtype == np.int16:
@@ -255,6 +300,15 @@ def preprocess_audio(
     except Exception as e:
         print(f"Error preprocessing audio: {e}")
         raise e
+    finally:
+        # Clean up converted WAV file if it was temporary
+        if converted_file_path and converted_file_path != original_file_path:
+            if os.path.exists(converted_file_path):
+                try:
+                    os.unlink(converted_file_path)
+                    print(f"Cleaned up temporary WAV file: {converted_file_path}")
+                except Exception as cleanup_error:
+                    print(f"Warning: Could not clean up temp file: {cleanup_error}")
 
 
 def transcribe_audio(audio_array: np.ndarray) -> tuple[str, float]:
@@ -334,20 +388,19 @@ async def transcribe_audio_file(
 ):
     """
     Transcribe audio file uploaded via multipart/form-data
+    Accepts any audio format and converts to WAV automatically
     """
     start_time = asyncio.get_event_loop().time()
 
     try:
-        # Validate file format
-        file_extension = Path(audio.filename).suffix.lower()
-        if file_extension not in SUPPORTED_FORMATS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Unsupported audio format: {file_extension}. "
-                    f"Supported formats: {SUPPORTED_FORMATS}"
-                ),
-            )
+        # Get file extension (or default to .m4a for unknown formats)
+        file_extension = Path(audio.filename).suffix.lower() if audio.filename else ".m4a"
+        
+        # Log the incoming file format
+        print(f"Received audio file: {audio.filename} (format: {file_extension})")
+        
+        # Accept any format - we'll convert to WAV if needed
+        # No need to restrict here since conversion handles all formats
 
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(
@@ -356,9 +409,11 @@ async def transcribe_audio_file(
             content = await audio.read()
             temp_file.write(content)
             temp_path = temp_file.name
+        
+        print(f"Saved uploaded file to: {temp_path} ({len(content)} bytes)")
 
         try:
-            # Load and preprocess audio
+            # Load and preprocess audio (this will convert to WAV if needed)
             audio_array, duration = preprocess_audio(temp_path)
 
             # Transcribe audio
@@ -413,18 +468,22 @@ async def transcribe_base64_audio(
             ) from e
 
         # Detect audio format from filename, content_type, or file header
-        file_ext = ".m4a"  # Default to m4a (common for React Native recordings)
+        # Also check for file_extension field (from frontend)
+        file_ext = request.file_extension  # New field from frontend
+        if file_ext and not file_ext.startswith('.'):
+            file_ext = f".{file_ext}"
         
         # Try filename first
-        if request.filename:
+        if not file_ext and request.filename:
             file_ext = Path(request.filename).suffix.lower() or ".m4a"
         
         # Try content_type second
-        elif request.content_type:
+        if not file_ext and request.content_type:
             content_type_map = {
                 'audio/wav': '.wav',
                 'audio/mpeg': '.mp3',
                 'audio/mp4': '.m4a',
+                'audio/x-m4a': '.m4a',
                 'audio/flac': '.flac',
                 'audio/ogg': '.ogg',
                 'audio/aac': '.aac',
@@ -432,7 +491,7 @@ async def transcribe_base64_audio(
             file_ext = content_type_map.get(request.content_type, '.m4a')
         
         # Fallback: detect from file header
-        else:
+        if not file_ext:
             if len(audio_data) >= 4:
                 header = audio_data[:4]
                 if header == b'RIFF' or header == b'RIFX':
@@ -443,10 +502,17 @@ async def transcribe_base64_audio(
                     file_ext = ".flac"
                 elif header[:4] == b'OggS':
                     file_ext = ".ogg"
+                elif header[:4] == b'\x00\x00\x00':  # M4A/MP4 often starts with this
+                    file_ext = ".m4a"
+                else:
+                    file_ext = ".m4a"  # Default fallback
+            else:
+                file_ext = ".m4a"  # Default fallback
         
-        # Ensure extension is in supported formats
+        # Ensure extension is in supported formats (or allow conversion)
+        # Note: We'll convert any format, so we don't need to restrict here
         if file_ext not in SUPPORTED_FORMATS:
-            file_ext = ".m4a"  # Default fallback
+            print(f"Warning: {file_ext} not in SUPPORTED_FORMATS, but will attempt conversion")
         
         # Save to temporary file with detected extension
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
