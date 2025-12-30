@@ -51,9 +51,28 @@ After deploying, test with:
 
 ### 🚀 Deployment Steps
 
-1. **Ensure FFmpeg is installed on server:**
+1. **CRITICAL: Install FFmpeg on server (REQUIRED):**
    ```bash
-   sudo apt-get install ffmpeg  # Ubuntu/Debian
+   # Ubuntu/Debian
+   sudo apt-get update
+   sudo apt-get install -y ffmpeg
+   
+   # macOS
+   brew install ffmpeg
+   
+   # CentOS/RHEL
+   sudo yum install epel-release
+   sudo yum install ffmpeg
+   ```
+   
+   **Verify installation:**
+   ```bash
+   ffmpeg -version
+   ```
+   
+   **Or use the check script:**
+   ```bash
+   python3 check_ffmpeg.py
    ```
 
 2. **Verify pydub is in requirements.txt:**
@@ -70,6 +89,13 @@ After deploying, test with:
    curl -X POST "https://aiapp.sazjoo.com/transcribe" \
      -F "audio=@test.m4a"
    ```
+
+### ⚠️ Common Issues
+
+**Error: "File format b'\\x00\\x00\\x00\\x1c' not understood"**
+- **Cause**: FFmpeg is not installed or not in PATH
+- **Solution**: Install FFmpeg (see step 1 above)
+- **Verify**: Run `ffmpeg -version` or `python3 check_ffmpeg.py`
 
 ### 🔍 What to Monitor
 

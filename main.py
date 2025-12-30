@@ -139,12 +139,22 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
     Returns the path to the converted WAV file
     
     Supports: MP3, M4A, FLAC, OGG, AAC, WMA, WAV, MP4, 3GP, etc.
+    
+    Requires: FFmpeg must be installed on the system
     """
     try:
         # Detect format from file extension
         file_ext = Path(input_path).suffix.lower()
         
-        print(f"Converting audio file: {input_path} (format: {file_ext})")
+        print(f"🔄 Converting audio file: {input_path} (format: {file_ext})")
+        
+        # Check if input file exists
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file does not exist: {input_path}")
+        
+        # Get file size for logging
+        file_size = os.path.getsize(input_path)
+        print(f"   Input file size: {file_size} bytes")
         
         # Map extensions to pydub format names
         format_map = {
@@ -163,22 +173,36 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
         audio_format = format_map.get(file_ext, None)
         
         # Load audio file using pydub
-        if audio_format:
-            if audio_format == 'wav':
-                audio = AudioSegment.from_wav(input_path)
-            elif audio_format == 'mp3':
-                audio = AudioSegment.from_mp3(input_path)
-            elif audio_format == 'ogg':
-                audio = AudioSegment.from_ogg(input_path)
+        try:
+            if audio_format:
+                if audio_format == 'wav':
+                    print(f"   Loading as WAV...")
+                    audio = AudioSegment.from_wav(input_path)
+                elif audio_format == 'mp3':
+                    print(f"   Loading as MP3...")
+                    audio = AudioSegment.from_mp3(input_path)
+                elif audio_format == 'ogg':
+                    print(f"   Loading as OGG...")
+                    audio = AudioSegment.from_ogg(input_path)
+                else:
+                    # Use from_file for formats like m4a, flac, aac, etc.
+                    print(f"   Loading as {audio_format.upper()}...")
+                    audio = AudioSegment.from_file(input_path, format=audio_format)
             else:
-                # Use from_file for formats like m4a, flac, aac, etc.
-                audio = AudioSegment.from_file(input_path, format=audio_format)
-        else:
-            # Auto-detect format (pydub will try to detect)
-            print(f"Auto-detecting format for {file_ext}...")
-            audio = AudioSegment.from_file(input_path)
+                # Auto-detect format (pydub will try to detect)
+                print(f"   Auto-detecting format...")
+                audio = AudioSegment.from_file(input_path)
+        except Exception as load_error:
+            error_msg = str(load_error)
+            if 'ffmpeg' in error_msg.lower() or 'not found' in error_msg.lower():
+                raise ValueError(
+                    f"FFmpeg is required for audio conversion but was not found. "
+                    f"Install it with: sudo apt-get install ffmpeg (Ubuntu/Debian) or "
+                    f"brew install ffmpeg (macOS). Original error: {error_msg}"
+                ) from load_error
+            raise ValueError(f"Failed to load audio file: {error_msg}") from load_error
         
-        print(f"Audio loaded: {len(audio)}ms, {audio.frame_rate}Hz, {audio.channels} channels")
+        print(f"   ✅ Audio loaded: {len(audio)}ms, {audio.frame_rate}Hz, {audio.channels} channels")
         
         # Export as WAV with proper settings for wav2vec2
         # Set to 16kHz mono (wav2vec2 requirement)
@@ -186,26 +210,46 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
         audio = audio.set_channels(1)  # Convert to mono
         
         # Export as WAV (PCM 16-bit)
-        audio.export(
-            output_path,
-            format='wav',
-            parameters=['-acodec', 'pcm_s16le']  # Ensure 16-bit PCM
-        )
-        
-        print(f"Successfully converted to WAV: {output_path}")
+        try:
+            print(f"   Exporting to WAV format...")
+            audio.export(
+                output_path,
+                format='wav',
+                parameters=['-acodec', 'pcm_s16le']  # Ensure 16-bit PCM
+            )
+        except Exception as export_error:
+            error_msg = str(export_error)
+            if 'ffmpeg' in error_msg.lower() or 'not found' in error_msg.lower():
+                raise ValueError(
+                    f"FFmpeg is required for audio export but was not found. "
+                    f"Install it with: sudo apt-get install ffmpeg. Original error: {error_msg}"
+                ) from export_error
+            raise ValueError(f"Failed to export WAV file: {error_msg}") from export_error
         
         # Verify the output file exists and has correct header
-        if os.path.exists(output_path):
-            with open(output_path, 'rb') as f:
-                header = f.read(4)
-                if header not in [b'RIFF', b'RIFX']:
-                    raise ValueError(f"Conversion failed: output file doesn't have WAV header. Got: {header}")
+        if not os.path.exists(output_path):
+            raise ValueError(f"Conversion failed: output file was not created at {output_path}")
         
+        output_size = os.path.getsize(output_path)
+        print(f"   Output file size: {output_size} bytes")
+        
+        with open(output_path, 'rb') as f:
+            header = f.read(4)
+            if header not in [b'RIFF', b'RIFX']:
+                raise ValueError(
+                    f"Conversion failed: output file doesn't have WAV header. "
+                    f"Got: {header} (expected RIFF or RIFX). "
+                    f"This usually means FFmpeg conversion failed."
+                )
+        
+        print(f"   ✅ Successfully converted to WAV: {output_path}")
         return output_path
     except Exception as e:
-        print(f"Error converting audio to WAV: {e}")
-        print(f"Input file: {input_path}, Output file: {output_path}")
-        raise ValueError(f"Failed to convert audio file to WAV: {str(e)}") from e
+        print(f"❌ Error converting audio to WAV: {e}")
+        print(f"   Input file: {input_path}")
+        print(f"   Output file: {output_path}")
+        # Re-raise with more context
+        raise
 
 
 def preprocess_audio(
@@ -224,19 +268,25 @@ def preprocess_audio(
     
     try:
         # Check if file is already WAV by reading first bytes
+        file_ext = Path(audio_file_path).suffix.lower()
+        print(f"Processing audio file: {audio_file_path} (extension: {file_ext})")
+        
         try:
             with open(audio_file_path, 'rb') as f:
                 header = f.read(4)
                 if header == b'RIFF' or header == b'RIFX':
                     is_wav = True
-                    print(f"File is already WAV format: {audio_file_path}")
+                    print(f"File is already WAV format (RIFF header detected)")
+                else:
+                    print(f"File is NOT WAV format (header: {header})")
         except Exception as e:
             print(f"Warning: Could not read file header: {e}")
+            is_wav = False
         
-        # Convert to WAV if needed
-        if not is_wav:
-            file_ext = Path(audio_file_path).suffix.lower()
-            print(f"Converting {file_ext} file to WAV format...")
+        # Always convert non-WAV files, or if header check failed
+        # Also convert if extension suggests it's not WAV
+        if not is_wav or (file_ext and file_ext not in ['.wav']):
+            print(f"Converting {file_ext or 'unknown'} file to WAV format...")
             
             # Create temporary WAV file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav:
@@ -244,21 +294,50 @@ def preprocess_audio(
             
             try:
                 # Convert to WAV
+                print(f"Calling convert_audio_to_wav({audio_file_path}, {converted_file_path})")
                 convert_audio_to_wav(audio_file_path, converted_file_path)
+                
+                # Verify conversion succeeded by checking the output file
+                if not os.path.exists(converted_file_path):
+                    raise ValueError("Conversion failed: output file was not created")
+                
+                # Verify it's a valid WAV file
+                with open(converted_file_path, 'rb') as f:
+                    wav_header = f.read(4)
+                    if wav_header not in [b'RIFF', b'RIFX']:
+                        raise ValueError(f"Conversion failed: output file is not a valid WAV (header: {wav_header})")
+                
                 audio_file_path = converted_file_path
-                print(f"Conversion successful, using: {audio_file_path}")
+                print(f"✅ Conversion successful, using: {audio_file_path}")
             except Exception as e:
                 # Clean up temp file if conversion failed
                 if converted_file_path and os.path.exists(converted_file_path):
-                    os.unlink(converted_file_path)
-                raise ValueError(f"Audio conversion failed: {str(e)}") from e
+                    try:
+                        os.unlink(converted_file_path)
+                    except:
+                        pass
+                error_msg = f"Audio conversion failed: {str(e)}"
+                print(f"❌ {error_msg}")
+                print(f"   This usually means FFmpeg is not installed or not in PATH")
+                print(f"   Install FFmpeg: sudo apt-get install ffmpeg (Ubuntu/Debian)")
+                raise ValueError(error_msg) from e
         
         # Load audio file using scipy (now guaranteed to be WAV)
         try:
+            print(f"Reading WAV file with scipy: {audio_file_path}")
             sr, audio = wavfile.read(audio_file_path)
-            print(f"Loaded WAV file: {len(audio)} samples at {sr}Hz")
+            print(f"✅ Loaded WAV file: {len(audio)} samples at {sr}Hz")
         except Exception as e:
-            raise ValueError(f"Failed to read WAV file: {str(e)}") from e
+            error_msg = str(e)
+            print(f"❌ Failed to read WAV file: {error_msg}")
+            # If the error mentions RIFF/RIFX, it means the file wasn't converted properly
+            if 'RIFF' in error_msg or 'RIFX' in error_msg:
+                raise ValueError(
+                    f"File format error - conversion may have failed. "
+                    f"Original error: {error_msg}. "
+                    f"Please ensure FFmpeg is installed: sudo apt-get install ffmpeg"
+                ) from e
+            raise ValueError(f"Failed to read WAV file: {error_msg}") from e
 
         # Convert to float and normalize
         if audio.dtype == np.int16:
@@ -357,7 +436,28 @@ async def get_model():
 # API Endpoints
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup"""
+    """Load model on startup and check dependencies"""
+    # Check if FFmpeg is available (required for audio conversion)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            print("✅ FFmpeg is available for audio conversion")
+        else:
+            print("⚠️  WARNING: FFmpeg check failed. Audio conversion may not work.")
+            print("   Install FFmpeg: sudo apt-get install ffmpeg")
+    except FileNotFoundError:
+        print("⚠️  WARNING: FFmpeg is NOT installed or not in PATH")
+        print("   Audio format conversion (M4A, MP3, etc.) will fail!")
+        print("   Install FFmpeg: sudo apt-get install ffmpeg")
+    except Exception as e:
+        print(f"⚠️  WARNING: Could not check FFmpeg: {e}")
+    
+    # Load model
     await load_model()
 
 
