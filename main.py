@@ -8,8 +8,10 @@ audio to text.
 
 import asyncio
 import base64
+import logging
 import os
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -24,6 +26,13 @@ from pydub import AudioSegment
 from scipy.io import wavfile
 from scipy.signal import resample
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -146,15 +155,24 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
         # Detect format from file extension
         file_ext = Path(input_path).suffix.lower()
         
-        print(f"🔄 Converting audio file: {input_path} (format: {file_ext})")
+        logger.info(f"🔄 [CONVERT] Starting conversion: {input_path} (format: {file_ext})")
+        logger.info(f"   [CONVERT] Output path: {output_path}")
         
         # Check if input file exists
         if not os.path.exists(input_path):
+            logger.error(f"   [CONVERT] ❌ Input file does not exist: {input_path}")
             raise FileNotFoundError(f"Input file does not exist: {input_path}")
         
         # Get file size for logging
         file_size = os.path.getsize(input_path)
-        print(f"   Input file size: {file_size} bytes")
+        logger.info(f"   [CONVERT] Input file size: {file_size} bytes")
+        
+        # Read and log file header
+        with open(input_path, 'rb') as f:
+            header_bytes = f.read(16)
+            header_hex = ' '.join(f'{b:02x}' for b in header_bytes)
+            logger.info(f"   [CONVERT] Input file header (hex): {header_hex}")
+            logger.info(f"   [CONVERT] Input file header (raw): {header_bytes}")
         
         # Map extensions to pydub format names
         format_map = {
@@ -171,29 +189,34 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
         
         # Get format, default to auto-detect if unknown
         audio_format = format_map.get(file_ext, None)
+        logger.info(f"   [CONVERT] Detected format: {audio_format or 'auto-detect'}")
         
         # Load audio file using pydub
         try:
+            logger.info(f"   [CONVERT] Attempting to load audio file...")
             if audio_format:
                 if audio_format == 'wav':
-                    print(f"   Loading as WAV...")
+                    logger.info(f"   [CONVERT] Loading as WAV...")
                     audio = AudioSegment.from_wav(input_path)
                 elif audio_format == 'mp3':
-                    print(f"   Loading as MP3...")
+                    logger.info(f"   [CONVERT] Loading as MP3...")
                     audio = AudioSegment.from_mp3(input_path)
                 elif audio_format == 'ogg':
-                    print(f"   Loading as OGG...")
+                    logger.info(f"   [CONVERT] Loading as OGG...")
                     audio = AudioSegment.from_ogg(input_path)
                 else:
                     # Use from_file for formats like m4a, flac, aac, etc.
-                    print(f"   Loading as {audio_format.upper()}...")
+                    logger.info(f"   [CONVERT] Loading as {audio_format.upper()} using from_file()...")
                     audio = AudioSegment.from_file(input_path, format=audio_format)
             else:
                 # Auto-detect format (pydub will try to detect)
-                print(f"   Auto-detecting format...")
+                logger.info(f"   [CONVERT] Auto-detecting format...")
                 audio = AudioSegment.from_file(input_path)
+            logger.info(f"   [CONVERT] ✅ Audio loaded successfully")
         except Exception as load_error:
             error_msg = str(load_error)
+            logger.error(f"   [CONVERT] ❌ Failed to load audio file: {error_msg}")
+            logger.error(f"   [CONVERT] Full traceback: {traceback.format_exc()}")
             if 'ffmpeg' in error_msg.lower() or 'not found' in error_msg.lower():
                 raise ValueError(
                     f"FFmpeg is required for audio conversion but was not found. "
@@ -202,23 +225,28 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
                 ) from load_error
             raise ValueError(f"Failed to load audio file: {error_msg}") from load_error
         
-        print(f"   ✅ Audio loaded: {len(audio)}ms, {audio.frame_rate}Hz, {audio.channels} channels")
+        logger.info(f"   [CONVERT] ✅ Audio loaded: {len(audio)}ms, {audio.frame_rate}Hz, {audio.channels} channels")
         
         # Export as WAV with proper settings for wav2vec2
         # Set to 16kHz mono (wav2vec2 requirement)
+        logger.info(f"   [CONVERT] Setting frame rate to {TARGET_SAMPLE_RATE}Hz and converting to mono...")
         audio = audio.set_frame_rate(TARGET_SAMPLE_RATE)
         audio = audio.set_channels(1)  # Convert to mono
         
         # Export as WAV (PCM 16-bit)
         try:
-            print(f"   Exporting to WAV format...")
+            logger.info(f"   [CONVERT] Exporting to WAV format: {output_path}")
+            logger.info(f"   [CONVERT] Using FFmpeg parameters: ['-acodec', 'pcm_s16le']")
             audio.export(
                 output_path,
                 format='wav',
                 parameters=['-acodec', 'pcm_s16le']  # Ensure 16-bit PCM
             )
+            logger.info(f"   [CONVERT] ✅ Export completed")
         except Exception as export_error:
             error_msg = str(export_error)
+            logger.error(f"   [CONVERT] ❌ Failed to export WAV file: {error_msg}")
+            logger.error(f"   [CONVERT] Full traceback: {traceback.format_exc()}")
             if 'ffmpeg' in error_msg.lower() or 'not found' in error_msg.lower():
                 raise ValueError(
                     f"FFmpeg is required for audio export but was not found. "
@@ -228,26 +256,35 @@ def convert_audio_to_wav(input_path: str, output_path: str) -> str:
         
         # Verify the output file exists and has correct header
         if not os.path.exists(output_path):
+            logger.error(f"   [CONVERT] ❌ Output file was not created: {output_path}")
             raise ValueError(f"Conversion failed: output file was not created at {output_path}")
         
         output_size = os.path.getsize(output_path)
-        print(f"   Output file size: {output_size} bytes")
+        logger.info(f"   [CONVERT] Output file size: {output_size} bytes")
         
+        # Verify WAV header
+        logger.info(f"   [CONVERT] Verifying WAV header...")
         with open(output_path, 'rb') as f:
             header = f.read(4)
+            header_hex = ' '.join(f'{b:02x}' for b in header)
+            logger.info(f"   [CONVERT] Output file header (hex): {header_hex}")
+            logger.info(f"   [CONVERT] Output file header (raw): {header}")
             if header not in [b'RIFF', b'RIFX']:
+                logger.error(f"   [CONVERT] ❌ Invalid WAV header! Expected RIFF or RIFX, got: {header}")
                 raise ValueError(
                     f"Conversion failed: output file doesn't have WAV header. "
                     f"Got: {header} (expected RIFF or RIFX). "
                     f"This usually means FFmpeg conversion failed."
                 )
+            logger.info(f"   [CONVERT] ✅ Valid WAV header confirmed")
         
-        print(f"   ✅ Successfully converted to WAV: {output_path}")
+        logger.info(f"   [CONVERT] ✅ Successfully converted to WAV: {output_path}")
         return output_path
     except Exception as e:
-        print(f"❌ Error converting audio to WAV: {e}")
-        print(f"   Input file: {input_path}")
-        print(f"   Output file: {output_path}")
+        logger.error(f"❌ [CONVERT] Error converting audio to WAV: {e}")
+        logger.error(f"   [CONVERT] Input file: {input_path}")
+        logger.error(f"   [CONVERT] Output file: {output_path}")
+        logger.error(f"   [CONVERT] Full traceback: {traceback.format_exc()}")
         # Re-raise with more context
         raise
 
@@ -269,69 +306,126 @@ def preprocess_audio(
     try:
         # Check if file is already WAV by reading first bytes
         file_ext = Path(audio_file_path).suffix.lower()
-        print(f"Processing audio file: {audio_file_path} (extension: {file_ext})")
+        logger.info(f"[PREPROCESS] Processing audio file: {audio_file_path} (extension: {file_ext})")
+        
+        # Check file exists and get size
+        if os.path.exists(audio_file_path):
+            file_size = os.path.getsize(audio_file_path)
+            logger.info(f"[PREPROCESS] File size: {file_size} bytes")
+        else:
+            logger.error(f"[PREPROCESS] ❌ File does not exist: {audio_file_path}")
+            raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
         
         try:
+            logger.info(f"[PREPROCESS] Reading file header...")
             with open(audio_file_path, 'rb') as f:
                 header = f.read(4)
+                header_hex = ' '.join(f'{b:02x}' for b in header)
+                logger.info(f"[PREPROCESS] File header (hex): {header_hex}")
+                logger.info(f"[PREPROCESS] File header (raw): {header}")
                 if header == b'RIFF' or header == b'RIFX':
                     is_wav = True
-                    print(f"File is already WAV format (RIFF header detected)")
+                    logger.info(f"[PREPROCESS] ✅ File is already WAV format (RIFF/RIFX header detected)")
                 else:
-                    print(f"File is NOT WAV format (header: {header})")
+                    logger.info(f"[PREPROCESS] File is NOT WAV format (header: {header})")
         except Exception as e:
-            print(f"Warning: Could not read file header: {e}")
+            logger.warning(f"[PREPROCESS] ⚠️  Could not read file header: {e}")
+            logger.warning(f"[PREPROCESS] Full traceback: {traceback.format_exc()}")
             is_wav = False
         
-        # Always convert non-WAV files, or if header check failed
-        # Also convert if extension suggests it's not WAV
-        if not is_wav or (file_ext and file_ext not in ['.wav']):
-            print(f"Converting {file_ext or 'unknown'} file to WAV format...")
+        # ALWAYS convert if extension is not .wav, regardless of header check
+        # This ensures M4A, MP3, etc. are always converted
+        should_convert = False
+        
+        if file_ext:
+            # If we have an extension, check if it's WAV
+            if file_ext != '.wav':
+                should_convert = True
+                logger.info(f"[PREPROCESS] File extension '{file_ext}' indicates non-WAV format, will convert")
+            else:
+                logger.info(f"[PREPROCESS] File extension is .wav")
+        elif not is_wav:
+            # No extension but header check says it's not WAV
+            should_convert = True
+            logger.info(f"[PREPROCESS] Header check indicates non-WAV format, will convert")
+        else:
+            # Extension is .wav and header check passed
+            should_convert = False
+            logger.info(f"[PREPROCESS] File appears to be WAV format, skipping conversion")
+        
+        # Convert if needed
+        if should_convert:
+            logger.info(f"[PREPROCESS] 🔄 Converting {file_ext or 'unknown format'} file to WAV format...")
             
             # Create temporary WAV file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav:
                 converted_file_path = temp_wav.name
+            logger.info(f"[PREPROCESS] Created temp WAV file: {converted_file_path}")
             
             try:
                 # Convert to WAV
-                print(f"Calling convert_audio_to_wav({audio_file_path}, {converted_file_path})")
+                logger.info(f"[PREPROCESS] Calling convert_audio_to_wav({audio_file_path}, {converted_file_path})")
                 convert_audio_to_wav(audio_file_path, converted_file_path)
                 
-                # Verify conversion succeeded by checking the output file
+                # Verify conversion succeeded by checking the output file exists
+                logger.info(f"[PREPROCESS] Verifying converted file exists...")
                 if not os.path.exists(converted_file_path):
+                    logger.error(f"[PREPROCESS] ❌ Conversion failed: output file was not created")
                     raise ValueError("Conversion failed: output file was not created")
                 
-                # Verify it's a valid WAV file
+                # Verify it's a valid WAV file by checking header
+                logger.info(f"[PREPROCESS] Verifying converted file has valid WAV header...")
                 with open(converted_file_path, 'rb') as f:
                     wav_header = f.read(4)
+                    wav_header_hex = ' '.join(f'{b:02x}' for b in wav_header)
+                    logger.info(f"[PREPROCESS] Converted file header (hex): {wav_header_hex}")
+                    logger.info(f"[PREPROCESS] Converted file header (raw): {wav_header}")
                     if wav_header not in [b'RIFF', b'RIFX']:
-                        raise ValueError(f"Conversion failed: output file is not a valid WAV (header: {wav_header})")
+                        logger.error(f"[PREPROCESS] ❌ Invalid WAV header in converted file!")
+                        raise ValueError(
+                            f"Conversion failed: output file is not a valid WAV. "
+                            f"Header: {wav_header} (expected RIFF or RIFX). "
+                            f"This usually means FFmpeg conversion failed."
+                        )
+                    logger.info(f"[PREPROCESS] ✅ Valid WAV header confirmed in converted file")
                 
+                # Use the converted file
                 audio_file_path = converted_file_path
-                print(f"✅ Conversion successful, using: {audio_file_path}")
+                logger.info(f"[PREPROCESS] ✅ Conversion successful, using: {audio_file_path}")
             except Exception as e:
                 # Clean up temp file if conversion failed
                 if converted_file_path and os.path.exists(converted_file_path):
                     try:
                         os.unlink(converted_file_path)
+                        logger.info(f"[PREPROCESS] Cleaned up failed conversion temp file")
                     except:
                         pass
                 error_msg = f"Audio conversion failed: {str(e)}"
-                print(f"❌ {error_msg}")
-                print(f"   This usually means FFmpeg is not installed or not in PATH")
-                print(f"   Install FFmpeg: sudo apt-get install ffmpeg (Ubuntu/Debian)")
+                logger.error(f"[PREPROCESS] ❌ {error_msg}")
+                logger.error(f"[PREPROCESS] Full traceback: {traceback.format_exc()}")
+                logger.error(f"[PREPROCESS] This usually means FFmpeg is not installed or not in PATH")
+                logger.error(f"[PREPROCESS] Install FFmpeg: sudo apt-get install ffmpeg (Ubuntu/Debian)")
+                logger.error(f"[PREPROCESS] Or: brew install ffmpeg (macOS)")
                 raise ValueError(error_msg) from e
+        else:
+            logger.info(f"[PREPROCESS] ✅ File is already WAV format, no conversion needed")
         
         # Load audio file using scipy (now guaranteed to be WAV)
         try:
-            print(f"Reading WAV file with scipy: {audio_file_path}")
+            logger.info(f"[PREPROCESS] Reading WAV file with scipy.wavfile.read(): {audio_file_path}")
+            # Double-check header before reading
+            with open(audio_file_path, 'rb') as f:
+                final_header = f.read(4)
+                logger.info(f"[PREPROCESS] Final file header before scipy read: {final_header}")
             sr, audio = wavfile.read(audio_file_path)
-            print(f"✅ Loaded WAV file: {len(audio)} samples at {sr}Hz")
+            logger.info(f"[PREPROCESS] ✅ Loaded WAV file: {len(audio)} samples at {sr}Hz")
         except Exception as e:
             error_msg = str(e)
-            print(f"❌ Failed to read WAV file: {error_msg}")
+            logger.error(f"[PREPROCESS] ❌ Failed to read WAV file with scipy: {error_msg}")
+            logger.error(f"[PREPROCESS] Full traceback: {traceback.format_exc()}")
             # If the error mentions RIFF/RIFX, it means the file wasn't converted properly
             if 'RIFF' in error_msg or 'RIFX' in error_msg:
+                logger.error(f"[PREPROCESS] This is the exact error the user is seeing!")
                 raise ValueError(
                     f"File format error - conversion may have failed. "
                     f"Original error: {error_msg}. "
@@ -377,7 +471,8 @@ def preprocess_audio(
         return audio, duration
 
     except Exception as e:
-        print(f"Error preprocessing audio: {e}")
+        logger.error(f"[PREPROCESS] ❌ Error preprocessing audio: {e}")
+        logger.error(f"[PREPROCESS] Full traceback: {traceback.format_exc()}")
         raise e
     finally:
         # Clean up converted WAV file if it was temporary
@@ -385,9 +480,9 @@ def preprocess_audio(
             if os.path.exists(converted_file_path):
                 try:
                     os.unlink(converted_file_path)
-                    print(f"Cleaned up temporary WAV file: {converted_file_path}")
+                    logger.info(f"[PREPROCESS] Cleaned up temporary WAV file: {converted_file_path}")
                 except Exception as cleanup_error:
-                    print(f"Warning: Could not clean up temp file: {cleanup_error}")
+                    logger.warning(f"[PREPROCESS] Could not clean up temp file: {cleanup_error}")
 
 
 def transcribe_audio(audio_array: np.ndarray) -> tuple[str, float]:
@@ -446,16 +541,17 @@ async def startup_event():
             timeout=5
         )
         if result.returncode == 0:
-            print("✅ FFmpeg is available for audio conversion")
+            logger.info("✅ FFmpeg is available for audio conversion")
+            logger.info(f"   FFmpeg version: {result.stdout.split(chr(10))[0]}")
         else:
-            print("⚠️  WARNING: FFmpeg check failed. Audio conversion may not work.")
-            print("   Install FFmpeg: sudo apt-get install ffmpeg")
+            logger.warning("⚠️  WARNING: FFmpeg check failed. Audio conversion may not work.")
+            logger.warning("   Install FFmpeg: sudo apt-get install ffmpeg")
     except FileNotFoundError:
-        print("⚠️  WARNING: FFmpeg is NOT installed or not in PATH")
-        print("   Audio format conversion (M4A, MP3, etc.) will fail!")
-        print("   Install FFmpeg: sudo apt-get install ffmpeg")
+        logger.error("⚠️  WARNING: FFmpeg is NOT installed or not in PATH")
+        logger.error("   Audio format conversion (M4A, MP3, etc.) will fail!")
+        logger.error("   Install FFmpeg: sudo apt-get install ffmpeg")
     except Exception as e:
-        print(f"⚠️  WARNING: Could not check FFmpeg: {e}")
+        logger.warning(f"⚠️  WARNING: Could not check FFmpeg: {e}")
     
     # Load model
     await load_model()
@@ -491,18 +587,49 @@ async def transcribe_audio_file(
     Accepts any audio format and converts to WAV automatically
     """
     start_time = asyncio.get_event_loop().time()
+    logger.info("=" * 80)
+    logger.info("[TRANSCRIBE] New transcription request received")
+    logger.info("=" * 80)
 
     try:
-        # Get file extension (or default to .m4a for unknown formats)
-        file_extension = Path(audio.filename).suffix.lower() if audio.filename else ".m4a"
+        # Get file extension from filename or content-type
+        file_extension = None
+        
+        # Try to get from filename first
+        if audio.filename:
+            file_extension = Path(audio.filename).suffix.lower()
+            logger.info(f"[TRANSCRIBE] Detected extension from filename: {file_extension}")
+        
+        # If no extension in filename, try content-type
+        if not file_extension and audio.content_type:
+            content_type_map = {
+                'audio/wav': '.wav',
+                'audio/mpeg': '.mp3',
+                'audio/mp4': '.m4a',
+                'audio/x-m4a': '.m4a',
+                'audio/flac': '.flac',
+                'audio/ogg': '.ogg',
+                'audio/aac': '.aac',
+            }
+            file_extension = content_type_map.get(audio.content_type)
+            if file_extension:
+                logger.info(f"[TRANSCRIBE] Detected extension from content-type '{audio.content_type}': {file_extension}")
+        
+        # Default to .m4a if still unknown (common for mobile recordings)
+        if not file_extension:
+            file_extension = ".m4a"
+            logger.info(f"[TRANSCRIBE] No extension detected, defaulting to: {file_extension}")
         
         # Log the incoming file format
-        print(f"Received audio file: {audio.filename} (format: {file_extension})")
+        logger.info(f"[TRANSCRIBE] 📥 Received audio file: {audio.filename or 'unnamed'}")
+        logger.info(f"[TRANSCRIBE]    Extension: {file_extension}")
+        logger.info(f"[TRANSCRIBE]    Content-Type: {audio.content_type}")
         
         # Accept any format - we'll convert to WAV if needed
         # No need to restrict here since conversion handles all formats
 
-        # Save uploaded file temporarily
+        # Save uploaded file temporarily with detected extension
+        logger.info(f"[TRANSCRIBE] Saving uploaded file to temp location...")
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=file_extension
         ) as temp_file:
@@ -510,16 +637,28 @@ async def transcribe_audio_file(
             temp_file.write(content)
             temp_path = temp_file.name
         
-        print(f"Saved uploaded file to: {temp_path} ({len(content)} bytes)")
+        logger.info(f"[TRANSCRIBE] 💾 Saved uploaded file to: {temp_path} ({len(content)} bytes)")
+        
+        # Log first few bytes of the file
+        if len(content) >= 16:
+            header_bytes = content[:16]
+            header_hex = ' '.join(f'{b:02x}' for b in header_bytes)
+            logger.info(f"[TRANSCRIBE] File header (first 16 bytes, hex): {header_hex}")
+            logger.info(f"[TRANSCRIBE] File header (first 16 bytes, raw): {header_bytes}")
 
         try:
             # Load and preprocess audio (this will convert to WAV if needed)
+            logger.info(f"[TRANSCRIBE] Starting audio preprocessing...")
             audio_array, duration = preprocess_audio(temp_path)
+            logger.info(f"[TRANSCRIBE] ✅ Audio preprocessing completed: {duration:.2f}s duration")
 
             # Transcribe audio
+            logger.info(f"[TRANSCRIBE] Starting transcription...")
             transcription, confidence = transcribe_audio(audio_array)
+            logger.info(f"[TRANSCRIBE] ✅ Transcription completed: '{transcription[:50]}...'")
 
             processing_time = asyncio.get_event_loop().time() - start_time
+            logger.info(f"[TRANSCRIBE] Total processing time: {processing_time:.2f}s")
 
             return TranscriptionResponse(
                 success=True,
@@ -532,11 +671,19 @@ async def transcribe_audio_file(
         finally:
             # Clean up temporary file
             if os.path.exists(temp_path):
-                os.unlink(temp_path)
+                try:
+                    os.unlink(temp_path)
+                    logger.info(f"[TRANSCRIBE] Cleaned up temp file: {temp_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"[TRANSCRIBE] Could not clean up temp file: {cleanup_error}")
 
     except ValueError as e:
+        logger.error(f"[TRANSCRIBE] ❌ ValueError: {str(e)}")
+        logger.error(f"[TRANSCRIBE] Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
+        logger.error(f"[TRANSCRIBE] ❌ Exception: {str(e)}")
+        logger.error(f"[TRANSCRIBE] Full traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500, detail=f"Transcription failed: {str(e)}"
         ) from e
